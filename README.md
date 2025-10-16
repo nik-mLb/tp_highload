@@ -16,6 +16,7 @@
 - Личный кабинет организатора для добавления мероприятий
 - Комментарии и оценки мероприятий
 - Интеграция с Яндекс.Картами для отображения локаций
+- Рекомендательная система
 
 **Продуктовые решения**
 - Микросервисная архитектура (Поиск, Рекомендации, Билеты, Пользователи, Мероприятия)
@@ -183,6 +184,136 @@
 - **Итого необходимо L7-балансировщиков: 5**
 
 Каждый балансировщик представляет собой виртуальную машину с 8-16 CPU, 16-32 ГБ ОЗУ и сетевым интерфейсом 10 Гбит/с.
+
+## 5. Логическая схема БД
+
+![alt text](image.png)
+
+### 📋 Таблица с описанием сущностей
+
+| Таблица | Назначение | Основные поля | Средний размер строки | QPS чтения / записи |
+|---------|------------|---------------|----------------------|-------------------|
+| users | Профили пользователей | id, email, name, avatar_url | ~500 Б | R: 50k / W: 5k |
+| organizers | Организаторы мероприятий | id, user_id, company_name, contact_phone | ~300 Б | R: 10k / W: 1k |
+| categories | Категории мероприятий | id, name, parent_id | ~100 Б | R: 5k / W: 100 |
+| venues | Места проведения | id, name, address, city, coordinates | ~400 Б | R: 15k / W: 500 |
+| events | Мероприятия | id, title, description, dates, prices | ~2 КБ | R: 200k / W: 20k |
+| event_images | Изображения мероприятий | id, event_id, image_url, is_main | ~200 Б | R: 100k / W: 10k |
+| tickets | Билеты | id, event_id, user_id, price, status | ~300 Б | R: 80k / W: 15k |
+| reviews | Отзывы и оценки | id, event_id, user_id, rating, comment | ~500 Б | R: 30k / W: 5k |
+| user_preferences | Предпочтения для рекомендаций | id, user_id, category_id, weight | ~100 Б | R: 20k / W: 3k |
+| search_history | История поиска | id, user_id, query_text, filters | ~400 Б | R: 10k / W: 8k |
+
+### ⚙️ Требования к консистентности
+
+| Таблица | Модель консистентности | Обоснование |
+|---------|------------------------|-------------|
+| users | Strong | Данные аутентификации должны быть строго консистентны |
+| organizers | Strong | Информация об организаторах критична для доверия |
+| events | Strong | Актуальность информации о мероприятиях и билетах |
+| tickets | Strong | Предотвращение продажи одних и тех же билетов |
+| venues | Strong | Геоданные должны быть точными |
+| reviews | Eventual | Отзывы могут реплицироваться с задержкой |
+| user_preferences | Eventual | Предпочтения не критичны к мгновенной синхронизации |
+| search_history | Eventual | История поиска допускает расхождения |
+
+### 🔑 Распределение нагрузки по ключам
+
+| Таблица | Ключи для распределения | Особенности |
+|---------|-------------------------|-------------|
+| users | id | Равномерное распределение по UUID |
+| events | id + city | Географическое шардирование по городам |
+| tickets | event_id | Группировка билетов по мероприятиям |
+| reviews | event_id | Локализация отзывов по событиям |
+| venues | city | Географическое распределение мест |
+| search_history | user_id | Персонализация истории поиска |
+
+## 6. Физическая схема БД
+
+### 6.1 Выбор СУБД по таблицам
+
+| Таблица | СУБД | Обоснование |
+|---------|------|-------------|
+| users | PostgreSQL | Strong consistency, сложные запросы профилей |
+| organizers | PostgreSQL | Связь с пользователями, ACID-транзакции |
+| categories | PostgreSQL | Статические данные, редко меняются |
+| venues | PostgreSQL + PostGIS | Географические запросы, сильная консистентность |
+| events | Cassandra | Высокая нагрузка чтения, географическое шардирование |
+| event_images | AWS S3 + PostgreSQL | Хранение файлов + метаданные |
+| tickets | PostgreSQL | Транзакционность, предотвращение двойных продаж |
+| reviews | Cassandra | Высокая частота записи отзывов |
+| user_preferences | Redis | Быстрый доступ для рекомендаций |
+| search_history | Elasticsearch | Полнотекстовый поиск, аналитика |
+
+### 6.2 Индексы
+
+```sql
+-- PostgreSQL индексы
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_organizers_user_id ON organizers(user_id);
+CREATE INDEX idx_venues_city ON venues(city);
+CREATE INDEX idx_events_organizer ON events(organizer_id);
+CREATE INDEX idx_events_category ON events(category_id);
+CREATE INDEX idx_events_city_date ON events(city, start_time);
+CREATE INDEX idx_tickets_event_user ON tickets(event_id, user_id);
+CREATE INDEX idx_tickets_status ON tickets(status);
+CREATE INDEX idx_reviews_event_rating ON reviews(event_id, rating);
+
+-- Cassandra индексы (вторичные)
+CREATE INDEX idx_events_city ON events(city);
+CREATE INDEX idx_events_start_time ON events(start_time);
+```
+
+### 6.3 Денормализация
+
+| Таблица | Денормализованные поля | Цель |
+|---------|------------------------|------|
+| events | venue_name, city, category_name | Ускорение поиска без JOIN |
+| tickets | event_title, event_date, venue_name | Быстрое отображение в ЛК |
+| reviews | user_name, event_title | Отображение без дополнительных запросов |
+| user_preferences | category_names[] | Быстрые рекомендации |
+
+### 6.4 Шардирование и резервирование
+
+| Таблица | Тип шардирования | Резервирование |
+|---------|------------------|----------------|
+| users | user_id mod N | PostgreSQL: 1 master + 2 replicas |
+| events | city (геошардирование) | Cassandra: RF=3, каждый регион |
+| tickets | event_id mod N | PostgreSQL: шардирование по событиям |
+| venues | city | PostgreSQL: географическое распределение |
+| reviews | event_id mod N | Cassandra: RF=3 |
+| search_history | user_id mod N | Elasticsearch: 3 реплики на шард |
+
+### 6.5 Клиентские библиотеки / интеграции
+
+- **PostgreSQL**: `psycopg2` (Python), `HikariCP` (Java)
+- **Cassandra**: `cassandra-driver` (Python), `DataStax Java Driver`
+- **Redis**: `redis-py`, `Lettuce` (Java)
+- **Elasticsearch**: `elasticsearch-py`, `RestHighLevelClient` (Java)
+- **AWS S3**: `boto3` (Python), `AWS SDK` (Java)
+
+### 6.6 Балансировка запросов / мультиплексирование
+
+- **PostgreSQL**: PgBouncer + HAProxy для connection pooling
+- **Cassandra**: Token-aware load balancing в драйвере
+- **Redis**: Redis Cluster с автоматическим шардированием
+- **Elasticsearch**: Coordinating nodes для распределения запросов
+
+### 6.7 Схема резервного копирования
+
+| СУБД | Стратегия бэкапа | RTO/RPO |
+|------|------------------|----------|
+| PostgreSQL | WAL-архивирование + pgBackRest | RTO: 15 мин, RPO: 5 мин |
+| Cassandra | Incremental snapshots + commitlog | RTO: 30 мин, RPO: 1 час |
+| Redis | RDB snapshots + AOF | RTO: 5 мин, RPO: 1 мин |
+| Elasticsearch | Snapshot to S3 | RTO: 20 мин, RPO: 15 мин |
+| AWS S3 | Versioning + Cross-region replication | RTO: 1 мин, RPO: 0 |
+
+**Расписание бэкапов:**
+- Ежедневные полные бэкапы в 02:00
+- Инкрементальные каждые 4 часа
+- WAL-архивы каждые 5 минут
+- Snapshot S3 - ежечасно
 
 ### Источники
 - SimilarWeb: https://www.similarweb.com/ru/website/afisha.yandex.ru/
