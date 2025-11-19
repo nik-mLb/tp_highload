@@ -356,28 +356,31 @@ CREATE INDEX idx_events_start_time ON events(start_time);
 
 ## 9. Обеспечение надёжности
 
-| Компонент системы | Способы резервирования |
-|-------------------|------------------------|
-| **L7 Балансировщики (Nginx)** | Active-Active кластер из 5 инстансов (N+1) с Anycast BGP. Health checks с автоматическим исключением неработающих узлов |
-| **Микросервисы (Kubernetes)** | ReplicaSet с минимум 3 репликами на сервис. Horizontal Pod Autoscaler по CPU/памяти. Graceful shutdown для сохранения состояния |
-| **PostgreSQL** | Patroni кластер: 1 master + 2 sync replicas. WAL-архивирование. PgBouncer для connection pooling. RTO: 15 мин, RPO: 5 мин |
-| **Cassandra** | RF=3 в каждом ДЦ. Multi-DC репликация. Hinted Handoff для временно недоступных узлов. Snapshot бэкапы ежедневно |
-| **Redis** | Redis Cluster с 6 узлами (3 master + 3 replica). Sentinel для автоматического failover. AOF + RDB персистентность |
-| **Elasticsearch** | 3 ноды в кластере. Index replica count = 2. Snapshot в S3 каждые 4 часа. RTO: 10 мин, RPO: 15 мин |
-| **AWS S3** | Cross-region replication. Versioning для всех объектов. 99.999999999% durability. RTO: 1 мин, RPO: 0 |
-| **Kafka** | 3-брокерный кластер. Replication factor = 3. Min.insync.replicas = 2. Мониторинг lag потребителей |
-| **Датa-центры** | 4 геораспределенных ДЦ (Москва, СПб, Екатеринбург, Алматы). Active-Active для чтения, Active-Passive для записи |
-| **CDN (CloudFront)** | 200+ edge-локаций глобально. Automatic failover между origin серверами. DDoS protection |
-| **Мониторинг** | Prometheus High Availability с 2 репликами. Thanos для long-term storage. Grafana с избыточными инстансами |
-| **DNS** | GeoDNS с Anycast. Multiple DNS провайдеры. TTL = 60 сек для быстрого переключения при сбоях |
-| **Платежный шлюз** | Active-Active в 2 ДЦ. Circuit breaker для внешних провайдеров. Retry с exponential backoff |
+## Stateful Graceful Shutdown для платежей
+1. Load balancer на новые запросы
+2. Завершение текущих транзакций (30 сек)
+3. Проверка idempotency keys в Redis
+4. Компенсирующие действия
+5. Фиксация состояния в Kafka
 
-**Дополнительные механизмы надежности:**
-- Chaos Engineering: регулярные тесты на отказоустойчивость
-- Canary deployments: постепенный rollout новых версий
-- Blue-Green deployments: мгновенный откат при проблемах
-- Comprehensive alerting: алерты по метрикам бизнес-логики
-- Disaster Recovery drills: регулярные учения по восстановлению
+## Асинхронная обработка с Outbox Pattern
+- **Outbox + CDC (Debezium)** → Kafka → Consumers
+- Атомарная запись в БД и очередь
+- Снижение latency с 2-3с до 200-300мс
+- Гарантированная доставка при недоступности consumers
+
+## Graceful Degradation с приоритизацией
+**Уровень 1: Search Service перегружен**
+- Упрощенный поиск по названию + фильтрация Cassandra
+- Кэш популярных запросов в Redis (5 мин TTL)
+
+**Уровень 2: Payment Service недоступен**
+- Режим "бронирования" билетов на 15 минут
+- RPS снижается с 9.5 до 0.5
+
+**Уровень 3: Cassandra деградирует**
+- Чтение из Redis кэша (1000 популярных событий)
+- Буферизация записи в Kafka
 
 ### Источники
 - SimilarWeb: https://www.similarweb.com/ru/website/afisha.yandex.ru/
